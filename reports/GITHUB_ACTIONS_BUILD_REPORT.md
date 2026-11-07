@@ -42,3 +42,12 @@ Run IDs/URLs, run commit SHA, compiler output, build status, final config SHA, i
 ## Next action
 
 Use GitHub Actions UI or a separately authorized API-capable environment to dispatch the two listed runs against the pushed full commit SHA. Then download each successful run artifact to `artifacts/github-actions/`, inspect checksums and ZIP/image contents, and update this report with actual run metadata. Physical vayu boot, recovery, stability, thermal, battery, and benchmark validation remain separate and pending.
+
+## Post-publication verification — 2026-11-07
+
+- Published commit: `75e6994142f3896f55146ca8019ad91a978cdf25` (`lab: prepare GitHub Actions kernel experiments`), parent `1d7baee8d8363b1a1369bd1b3e654e30d5d5cc87`.
+- Verified remote branch: `experiment/m0-m1-reproducible-baseline` points to the published commit and expected tree `09800e2220b1f6663d3e03b6001d71938e960602`.
+- The commit was created and fast-forwarded through the connected GitHub Git-data interface because this environment's local `.git/index` is not writable. No production repository was touched.
+- A post-push query of the Lab branch Actions runs returned `total_count: 0`. The available connected tools do not expose workflow dispatch; the shell also cannot create network sockets. Therefore neither requested run was dispatched, and no run URL, build status, or artifact exists.
+- Exact manual UI runs: open `https://github.com/Lvyana-ren/Xen-Kernel-Lab/actions/workflows/build-kernel.yml`, select **Run workflow**, branch `experiment/m0-m1-reproducible-baseline`, and set `source_ref=75e6994142f3896f55146ca8019ad91a978cdf25`, `release_flavor=xen`, `release_generation=3`, `cpu_experiment=baseline`, `memory_experiment=baseline`. First choose `toolchain=clang-r547379`; after recording its run ID/status, repeat with only `toolchain=clang-r614150` changed.
+- Both builds, artifact download, checksum/image validation, and device validation remain pending. Do not infer success from publication or static checks.
