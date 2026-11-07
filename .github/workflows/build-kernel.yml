@@ -2,6 +2,25 @@ name: Xen-Kernel - Default
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch name or commit SHA to build
+        required: true
+        default: "16"
+        type: string
+      release_flavor:
+        description: Kernel release label
+        required: true
+        default: xen
+        type: choice
+        options:
+          - xen
+          - ksun
+      release_generation:
+        description: Xen release generation number
+        required: true
+        default: "3"
+        type: string
 
 permissions:
   contents: read
@@ -23,14 +42,57 @@ jobs:
       CCACHE_COMPILERCHECK: "%compiler% --version"
       KBUILD_BUILD_USER: Lvyana
       KBUILD_BUILD_HOST: Xen-Kernel
+      SOURCE_REF: ${{ inputs.source_ref }}
+      RELEASE_FLAVOR: ${{ inputs.release_flavor }}
+      RELEASE_GENERATION: ${{ inputs.release_generation }}
 
     steps:
       - name: Checkout Xen-Kernel source
         uses: actions/checkout@v4
         with:
-          ref: "16"
-          fetch-depth: 1
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
           lfs: true
+          persist-credentials: false
+
+      - name: Validate dispatch inputs and source selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_REF" ]] || { echo "::error::source_ref must not be empty"; exit 1; }
+          [[ "$RELEASE_FLAVOR" == xen || "$RELEASE_FLAVOR" == ksun ]] || { echo "::error::Invalid release flavor"; exit 1; }
+          [[ "$RELEASE_GENERATION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::release_generation must be a positive integer"; exit 1; }
+          ACTUAL_SHA=$(git rev-parse --verify HEAD^{commit})
+          if [[ "$SOURCE_REF" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+            REQUESTED_SHA=$(git rev-parse --verify "$SOURCE_REF^{commit}")
+          else
+            git check-ref-format --branch "$SOURCE_REF"
+            if git show-ref --verify --quiet "refs/heads/$SOURCE_REF"; then
+              REQUESTED_SHA=$(git rev-parse --verify "refs/heads/$SOURCE_REF^{commit}")
+            elif git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF"; then
+              REQUESTED_SHA=$(git rev-parse --verify "refs/remotes/origin/$SOURCE_REF^{commit}")
+            else
+              echo "::error::Requested branch '$SOURCE_REF' was not fetched; refusing to fall back to another branch"; exit 1
+            fi
+          fi
+          [[ "$ACTUAL_SHA" == "$REQUESTED_SHA" ]] || {
+            echo "::error::Checkout SHA $ACTUAL_SHA does not match requested ref $SOURCE_REF ($REQUESTED_SHA)"; exit 1;
+          }
+          {
+            echo "Source ref validation: PASS"
+            echo "Requested ref: $SOURCE_REF"
+            echo "Resolved source SHA: $ACTUAL_SHA"
+            echo "Workflow trigger ref: ${GITHUB_REF:-unknown}"
+            echo "Workflow trigger SHA: ${GITHUB_SHA:-unknown}"
+          } | tee source-validation.txt
+          echo "Requested source ref: $SOURCE_REF"
+          echo "Resolved source ref: $(git describe --tags --always --dirty=)"
+          echo "Actual source SHA: $ACTUAL_SHA"
+          echo "Workflow trigger ref: ${GITHUB_REF:-unknown}"
+          echo "Workflow trigger SHA: ${GITHUB_SHA:-unknown}"
+          echo "RUNNER_OS=${RUNNER_OS:-unknown} RUNNER_ARCH=${RUNNER_ARCH:-unknown} ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+          echo "KBUILD_BUILD_TIMESTAMP=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
+          date -u +%Y-%m-%dT%H:%M:%SZ > build-started-utc.txt
 
       - name: Install build dependencies
         shell: bash
@@ -57,16 +119,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -x "$HOME/clang/bin/clang" ] || [ ! -x "$HOME/clang/bin/ld.lld" ]; then
-            rm -rf "$HOME/clang"
+          TOOLCHAIN_DIR="$RUNNER_TEMP/xen-clang-r547379"
+          if [ ! -x "$TOOLCHAIN_DIR/bin/clang" ] || [ ! -x "$TOOLCHAIN_DIR/bin/ld.lld" ]; then
             git clone --depth=1 --single-branch --branch 15.0 \
               https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git \
-              "$HOME/clang"
-            rm -rf "$HOME/clang/.git"
+              "$TOOLCHAIN_DIR"
           fi
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          "$HOME/clang/bin/clang" --version
-          "$HOME/clang/bin/ld.lld" --version
+          TOOLCHAIN_COMMIT=$(git -C "$TOOLCHAIN_DIR" rev-parse HEAD)
+          TOOLCHAIN_TREE_SHA256=$(cd "$TOOLCHAIN_DIR" && find . -type f ! -path './.git/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+          echo "$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
+          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_COMMIT=$TOOLCHAIN_COMMIT" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_TREE_SHA256=$TOOLCHAIN_TREE_SHA256" >> "$GITHUB_ENV"
+          "$TOOLCHAIN_DIR/bin/clang" --version
+          "$TOOLCHAIN_DIR/bin/ld.lld" --version
 
       - name: Validate source and toolchains
         shell: bash
@@ -80,6 +146,8 @@ jobs:
           test -f drivers/block/zram/zram_drv.c
           echo "===== Source commit ====="
           git rev-parse HEAD
+          echo "Expected checkout commit: ${GITHUB_SHA:-unknown}"
+          echo "Workflow ref: ${GITHUB_REF:-unknown}"
           git log -1 --oneline
           echo "===== Kernel version ====="
           make kernelversion
@@ -88,42 +156,48 @@ jobs:
           echo "===== GCC32 ====="
           arm-linux-gnueabi-gcc --version
           echo "===== Clang ====="
-          "$HOME/clang/bin/clang" --version
+          "$TOOLCHAIN_DIR/bin/clang" --version
+          "$TOOLCHAIN_DIR/bin/ld.lld" --version
 
-      # The cpu_subsys compile failure is addressed conservatively:
-      # include the kernel header that declares cpu_subsys, only if needed.
-      - name: Guard hyp_core_ctl cpu_subsys declaration
+      - name: Record source identity and apply checked build patches
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path("drivers/soc/qcom/hyp_core_ctl.c")
-          header = Path("include/linux/cpu.h")
-          text = source.read_text()
-          header_text = header.read_text()
-
-          if "cpu_subsys" in text and "cpu_subsys" not in header_text:
-              raise SystemExit(
-                  "Expected cpu_subsys declaration was not found in include/linux/cpu.h; "
-                  "stopping rather than applying an unsafe workaround."
-              )
-
-          if "cpu_subsys" in text and "#include <linux/cpu.h>" not in text:
-              anchor = "#include <linux/init.h>"
-              if anchor not in text:
-                  raise SystemExit("Cannot safely locate include anchor in hyp_core_ctl.c")
-              text = text.replace(anchor, anchor + "\n#include <linux/cpu.h>", 1)
-              source.write_text(text)
-              print("Added missing #include <linux/cpu.h> to hyp_core_ctl.c")
-          else:
-              print("cpu.h include already present or cpu_subsys is not used; no change needed.")
-          PY
-          grep -n 'cpu_subsys\|linux/cpu.h' drivers/soc/qcom/hyp_core_ctl.c
+          ORIGINAL_SOURCE_SHA=$(git rev-parse --verify HEAD^{commit})
+          printf '%s\n' "$ORIGINAL_SOURCE_SHA" | tee original-source-sha.txt
+          echo "ORIGINAL_SOURCE_SHA=$ORIGINAL_SOURCE_SHA" >> "$GITHUB_ENV"
+          grep -q 'cpu_subsys' drivers/soc/qcom/hyp_core_ctl.c || {
+            echo "::error::Expected hyp_core_ctl cpu_subsys reference is absent"; exit 1;
+          }
+          grep -q 'extern struct bus_type cpu_subsys;' include/linux/cpu.h || {
+            echo "::error::Expected cpu_subsys declaration is absent from include/linux/cpu.h"; exit 1;
+          }
+          : > applied-patches.txt
+          for PATCH_FILE in \
+            ci-patches/0001-hyp-core-ctl-include-cpu-header.diff \
+            ci-patches/0002-xen-release-extraversion.diff; do
+            test -f "$PATCH_FILE" || { echo "::error::Required patch missing: $PATCH_FILE"; exit 1; }
+            PATCH_SHA=$(sha256sum "$PATCH_FILE" | awk '{print $1}')
+            if git apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+              PATCH_STATUS=already-applied
+            elif git apply --check "$PATCH_FILE" >/dev/null 2>&1; then
+              git apply "$PATCH_FILE"
+              PATCH_STATUS=applied
+            else
+              echo "::error::Patch context mismatch; refusing source transformation: $PATCH_FILE"
+              exit 1
+            fi
+            printf '%s\t%s\t%s\n' "$PATCH_STATUS" "$PATCH_FILE" "$PATCH_SHA" | tee -a applied-patches.txt
+          done
           git diff --check
+          [[ $(grep -c '^#include <linux/cpu.h>$' drivers/soc/qcom/hyp_core_ctl.c) -eq 1 ]] || {
+            echo "::error::hyp_core_ctl patch postcondition failed"; exit 1;
+          }
+          [[ $(grep -c '^EXTRAVERSION =$' Makefile) -eq 1 ]] || {
+            echo "::error::release patch postcondition failed"; exit 1;
+          }
 
-      - name: Verify ZRAM default compressor
+      - name: Verify baseline ZRAM implementation
         shell: bash
         run: |
           set -euo pipefail
@@ -135,14 +209,11 @@ jobs:
           text = path.read_text()
           match = re.search(r'(?m)^\s*static const char \*default_compressor\s*=\s*"([^"]+)"\s*;', text)
           if not match:
-              raise SystemExit("Cannot identify ZRAM default_compressor safely; refusing blind source replacement.")
+              raise SystemExit("Cannot identify ZRAM default_compressor; refusing unverified baseline source.")
           current = match.group(1)
           if current != "lz4":
-              text = text[:match.start(1)] + "lz4" + text[match.end(1):]
-              path.write_text(text)
-              print(f"Changed ZRAM default compressor: {current} -> lz4")
-          else:
-              print("ZRAM default compressor is already LZ4.")
+              raise SystemExit(f"Expected tracked Xen baseline ZRAM default lz4; found {current!r}; no source edit will be made.")
+          print("ZRAM baseline source default is lz4; implementation is unchanged.")
           PY
           grep -n 'default_compressor' drivers/block/zram/zram_drv.c
           git diff --check
@@ -151,7 +222,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
 
           LLVM_VARS=(
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm STRIP=llvm-strip
@@ -165,10 +236,17 @@ jobs:
           )
           KMAKE=(make ARCH=arm64 O=out "${LLVM_VARS[@]}")
 
+          if [[ "$RELEASE_FLAVOR" == ksun ]]; then
+            LOCAL_VERSION="-Xen-KSUN+${RELEASE_GENERATION}"
+          else
+            LOCAL_VERSION="-Xen+${RELEASE_GENERATION}"
+          fi
+          echo "LOCAL_VERSION=$LOCAL_VERSION" >> "$GITHUB_ENV"
+
           "${KMAKE[@]}" vayu_defconfig
 
           scripts/config --file out/.config \
-            --set-str LOCALVERSION "-Xen+3" \
+            --set-str LOCALVERSION "$LOCAL_VERSION" \
             --disable LOCALVERSION_AUTO \
             --enable LTO \
             --enable LTO_CLANG \
@@ -196,37 +274,45 @@ jobs:
             exit 1
           fi
 
+          {
+            echo "ThinLTO: PASS (CONFIG_LTO=y CONFIG_LTO_CLANG=y CONFIG_THINLTO=y)"
+            echo "Performance optimization: PASS (CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y)"
+          } | tee config-validation.txt
+
           
           cp out/.config xen-default.config
-          echo "===== Kernel release ====="
-          "${KMAKE[@]}" kernelrelease
 
-      # Buang tag -openela dari versi kernel
-      - name: Strip -openela from kernel version
+      - name: Validate kernel release source and generated name
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          echo "Sebelum:"
-          grep -n '^EXTRAVERSION' Makefile
-
-          sed -i -E 's/^EXTRAVERSION[[:space:]]*=.*/EXTRAVERSION =/' Makefile
-
-          echo "Sesudah:"
-          grep -n '^EXTRAVERSION' Makefile
-
-          if make kernelversion | grep -q openela; then
-            echo "::error::Tag openela masih ada."
-            exit 1
+          path = Path("Makefile")
+          text = path.read_text()
+          matches = re.findall(r"(?m)^EXTRAVERSION\s*=\s*(.*)$", text)
+          if matches != [""]:
+              raise SystemExit(f"Expected exactly one empty EXTRAVERSION after checked release patch; found {matches!r}")
+          PY
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          RELEASE=$(make ARCH=arm64 O=out CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 kernelrelease)
+          printf '%s\n' "$RELEASE" | tee kernel-release-validated.txt
+          if [[ "$RELEASE_FLAVOR" == ksun ]]; then
+            [[ "$RELEASE" =~ ^4\.14\.357-Xen-KSUN\+[1-9][0-9]*$ ]] || { echo "::error::Unexpected KSUN kernel release: $RELEASE"; exit 1; }
+          else
+            [[ "$RELEASE" =~ ^4\.14\.357-Xen\+[1-9][0-9]*$ ]] || { echo "::error::Unexpected Xen kernel release: $RELEASE"; exit 1; }
           fi
-
-          make kernelversion
+          [[ "$RELEASE" == "4.14.357${LOCAL_VERSION}" ]] || { echo "::error::Generated release does not match requested flavor/generation"; exit 1; }
+          echo "Kernel release validation: PASS ($RELEASE)" | tee release-validation.txt
+          git diff --check
 
       - name: Compile Xen-Kernel Image
         shell: bash
         run: |
           set -uo pipefail
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
           set +e
           make -j"$(nproc)" \
             O=out \
@@ -251,6 +337,7 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             CC="ccache clang" \
+            V=1 \
             Image 2>&1 | tee build.log
           BUILD_STATUS=${PIPESTATUS[0]}
           set -e
@@ -260,6 +347,9 @@ jobs:
             grep -n -m 30 -E 'error:|undefined (symbol|reference)|ld.lld: error|Error [0-9]+$' build.log || true
             exit "$BUILD_STATUS"
           fi
+
+          grep -q -- '-flto=thin' build.log || { echo "::error::Build log has no ThinLTO compiler/linker flag evidence"; exit 1; }
+          grep -q 'ld.lld' build.log || { echo "::error::Build log has no LLD invocation evidence"; exit 1; }
 
           IMAGE="out/arch/arm64/boot/Image"
           if [ ! -s "$IMAGE" ]; then
@@ -271,6 +361,7 @@ jobs:
           ls -lh "$IMAGE"
           echo "===== Kernel release ====="
           cat out/include/config/kernel.release
+          cmp kernel-release-validated.txt out/include/config/kernel.release
 
           echo "===== LTO config embedded in Image ====="
           if [ -x scripts/extract-ikconfig ]; then
@@ -289,6 +380,14 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p artifacts
+          date -u +%Y-%m-%dT%H:%M:%SZ > artifacts/collected-at-utc.txt
+          [[ ! -f build-started-utc.txt ]] || cp build-started-utc.txt artifacts/
+          [[ ! -f original-source-sha.txt ]] || cp original-source-sha.txt artifacts/
+          [[ ! -f applied-patches.txt ]] || cp applied-patches.txt artifacts/
+          [[ ! -f config-validation.txt ]] || cp config-validation.txt artifacts/
+          [[ ! -f source-validation.txt ]] || cp source-validation.txt artifacts/
+          [[ ! -f release-validation.txt ]] || cp release-validation.txt artifacts/
+          [[ ! -f kernel-release-validated.txt ]] || cp kernel-release-validated.txt artifacts/
           [[ ! -f build.log ]] || cp build.log artifacts/
           [[ ! -f xen-default.config ]] || cp xen-default.config artifacts/
           [[ ! -f out/.config ]] || cp out/.config artifacts/kernel.config
@@ -309,9 +408,65 @@ jobs:
             cp out/include/config/kernel.release artifacts/kernel-release.txt
           fi
           git rev-parse HEAD > artifacts/source-commit.txt 2>/dev/null || true
+          git branch --show-current > artifacts/source-branch.txt 2>/dev/null || true
+          printf '%s\n' "${SOURCE_REF:-unknown}" > artifacts/requested-source-ref.txt
+          printf '%s\n' "${GITHUB_REF:-unknown}" > artifacts/workflow-trigger-ref.txt
+          printf '%s\n' "${GITHUB_SHA:-unknown}" > artifacts/workflow-trigger-sha.txt
+          {
+            echo "runner_os=${RUNNER_OS:-unknown}"
+            echo "runner_arch=${RUNNER_ARCH:-unknown}"
+            echo "image_os=${ImageOS:-unknown}"
+            echo "image_version=${ImageVersion:-unknown}"
+            echo "runs_on_label=ubuntu-22.04"
+            echo "uname=$(uname -a)"
+            cat /etc/os-release 2>/dev/null || true
+          } > artifacts/runner-environment.txt
+          {
+            echo "# Mutable dependency sources used by this workflow"
+            echo "runner_label=ubuntu-22.04 (hosted image contents can change)"
+            echo "apt_sources=Ubuntu 22.04 repositories after apt-get update (package versions below are resolved per run)"
+            echo "checkout_action=actions/checkout@v4 (mutable major tag)"
+            echo "cache_action=actions/cache@v4 (mutable major tag)"
+            echo "upload_artifact_action=actions/upload-artifact@v4 (mutable major tag)"
+            echo "clang_source=https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git"
+            echo "clang_ref=15.0 (mutable branch; resolved commit and content tree hash are in toolchain-provenance.txt)"
+            echo "--- installed versions ---"
+            dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | sort || true
+          } > artifacts/mutable-dependencies.txt
+          {
+            echo "toolchain_git_commit=${TOOLCHAIN_COMMIT:-unknown}"
+            echo "toolchain_tree_sha256=${TOOLCHAIN_TREE_SHA256:-unknown}"
+            echo "original_source_sha=${ORIGINAL_SOURCE_SHA:-unknown}"
+          } > artifacts/toolchain-provenance.txt
           clang --version > artifacts/clang-version.txt 2>&1 || true
+          ld.lld --version > artifacts/lld-version.txt 2>&1 || true
+          aarch64-linux-gnu-gcc --version > artifacts/gcc-aarch64-version.txt 2>&1 || true
+          arm-linux-gnueabi-gcc --version > artifacts/gcc-arm-version.txt 2>&1 || true
+          aarch64-linux-gnu-ld --version > artifacts/binutils-aarch64-version.txt 2>&1 || true
+          arm-linux-gnueabi-ld --version > artifacts/binutils-arm-version.txt 2>&1 || true
+          make --version > artifacts/make-version.txt 2>&1 || true
           ccache -s > artifacts/ccache-stats.txt 2>&1 || true
-          git diff -- drivers/soc/qcom/hyp_core_ctl.c drivers/block/zram/zram_drv.c > artifacts/workflow-source-patches.diff 2>/dev/null || true
+          git diff --binary HEAD > artifacts/post-patch-source.diff 2>/dev/null || true
+          git diff --binary HEAD > artifacts/workflow-source-patches.diff 2>/dev/null || true
+          if [[ -d ci-patches ]]; then
+            cp -R ci-patches artifacts/ci-patches
+            find artifacts/ci-patches -type f -print0 | sort -z | xargs -0 sha256sum > artifacts/patch-sha256.txt
+          fi
+          git status --short > artifacts/worktree-status.txt 2>/dev/null || true
+          git ls-files --others --exclude-standard 2>/dev/null \
+            | grep -Ev '^(artifacts/|out/|build\.log$|kernel-release-validated\.txt$|config-validation\.txt$|source-validation\.txt$|release-validation\.txt$|build-started-utc\.txt$|xen-default\.config$)' \
+            > artifacts/untracked-files.txt || true
+          if [[ -s artifacts/untracked-files.txt ]]; then
+            tar -czf artifacts/workflow-untracked-files.tar.gz -T artifacts/untracked-files.txt 2>/dev/null || true
+          fi
+          if [[ -s out/arch/arm64/boot/Image ]]; then
+            sha256sum out/arch/arm64/boot/Image > artifacts/Image.sha256
+            stat -c '%n %s bytes' out/arch/arm64/boot/Image > artifacts/Image.size.txt
+          fi
+          if [[ -f build.log ]]; then
+            grep -E -m 200 'clang version|clang .* -c |ld\.lld|-flto=thin|thinlto|ThinLTO|CONFIG_(LTO|LTO_CLANG|THINLTO)' build.log > artifacts/thinlto-build-evidence.txt || true
+          fi
+          find artifacts -type f ! -name artifact-checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > artifacts/artifact-checksums.sha256
           find artifacts -type f -exec ls -lh '{}' \;
 
       - name: Upload Xen-Kernel Default artifacts
@@ -321,4 +476,4 @@ jobs:
           name: Xen-Kernel-Default
           path: artifacts/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30

@@ -1,0 +1,10 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -2,5 +2,5 @@
+ VERSION = 4
+ PATCHLEVEL = 14
+ SUBLEVEL = 357
+-EXTRAVERSION = -openela
++EXTRAVERSION =
+ NAME = Petit Gorille

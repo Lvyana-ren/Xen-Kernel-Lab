@@ -1,0 +1,10 @@
+diff --git a/drivers/soc/qcom/hyp_core_ctl.c b/drivers/soc/qcom/hyp_core_ctl.c
+--- a/drivers/soc/qcom/hyp_core_ctl.c
++++ b/drivers/soc/qcom/hyp_core_ctl.c
+@@ -12,5 +12,6 @@
+ #define pr_fmt(fmt)	"hyp_core_ctl: " fmt
+ 
+ #include <linux/init.h>
++#include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/kthread.h>
