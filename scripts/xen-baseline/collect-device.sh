@@ -105,6 +105,8 @@ collect_glob() {
 collect_one /sys/devices/system/cpu/online
 collect_one /sys/devices/system/cpu/possible
 collect_one /sys/devices/system/cpu/present
+collect_one /sys/devices/system/cpu/isolated
+collect_one /sys/devices/system/cpu/nohz_full
 collect_glob '/sys/devices/system/cpu/cpu[0-9]*/online'
 collect_glob '/sys/devices/system/cpu/cpu[0-9]*/cpufreq/*'
 collect_glob '/sys/devices/system/cpu/cpu[0-9]*/core_ctl/*'
@@ -146,10 +148,26 @@ for path in /proc/meminfo /proc/vmstat /proc/zoneinfo /proc/swaps /proc/pressure
     collect_one "$path"
 done
 collect_glob '/proc/sys/kernel/sched_*'
+# Android schedtune commonly appears under /dev/stune or a cgroup mount.
+# Read only the controller's scalar policy files; never collect task lists.
+for root in /dev/stune /sys/fs/cgroup/stune /sys/fs/cgroup/schedtune; do
+    for attr in schedtune.boost schedtune.prefer_idle schedtune.sched_boost_no_override schedtune.colocate boost prefer_idle; do
+        collect_glob "$root/$attr"
+        collect_glob "$root/*/$attr"
+    done
+done
 for path in /sys/devices/system/cpu/hyp_core_ctl/enable /sys/devices/system/cpu/hyp_core_ctl/status \
             /sys/kernel/debug/hyp_core_ctl/reserve_cpus; do
     collect_one "$path"
 done
+
+# Bounded block-device policy and counters for storage/I/O characterization.
+collect_one /proc/diskstats
+for attr in scheduler read_ahead_kb nr_requests rotational io_timeout; do
+    collect_glob "/sys/block/*/queue/$attr"
+done
+collect_glob '/sys/block/*/stat'
+collect_glob '/sys/block/*/inflight'
 
 # Small, targeted runtime/suspend diagnostics and one bounded kernel log snapshot.
 for path in /sys/power/state /sys/power/wakeup_count /sys/power/suspend_stats/success /sys/power/suspend_stats/fail /sys/power/suspend_stats/last_failed_dev \

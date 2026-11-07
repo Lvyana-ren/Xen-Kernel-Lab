@@ -967,10 +967,21 @@ static int sugov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
+#ifdef CONFIG_XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+	/* Experimental A/B build; normal builds retain the driver delay. */
+	tunables->up_rate_limit_us = 0;
+	tunables->down_rate_limit_us = 0;
+#elif defined(CONFIG_XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT)
+	/* Keep the downward delay while testing upward response independently. */
+	tunables->up_rate_limit_us = 0;
+	tunables->down_rate_limit_us =
+				cpufreq_policy_transition_delay_us(policy);
+#else
 	tunables->up_rate_limit_us =
 				cpufreq_policy_transition_delay_us(policy);
 	tunables->down_rate_limit_us =
 				cpufreq_policy_transition_delay_us(policy);
+#endif
 	tunables->hispeed_load = DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_freq = 0;
 

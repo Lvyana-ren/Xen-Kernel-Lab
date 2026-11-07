@@ -230,6 +230,27 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 	  If in doubt, say N.
 
+config XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+	bool "Xen experiment: disable schedutil rate limits"
+	depends on CPU_FREQ_GOV_SCHEDUTIL
+	default n
+	help
+	  Experimental A/B option for measuring scheduler-to-frequency response.
+	  When enabled, schedutil starts with zero up/down rate limits. Runtime
+	  governor tunables can still change those values. This can increase
+	  frequency transition activity, energy use, and thermal load. Keep
+	  disabled for normal Xen builds.
+
+config XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT
+	bool "Xen experiment: disable schedutil upward rate limit"
+	depends on CPU_FREQ_GOV_SCHEDUTIL && !XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+	default n
+	help
+	  Experimental A/B option to remove only schedutil's upward rate limit
+	  while retaining the policy transition delay for downward changes. This
+	  can increase frequency transition activity, energy use, and thermal
+	  load. Keep disabled for normal Xen builds.
+
 config CPU_FREQ_GOV_INTERACTIVE
 	tristate "'interactive' cpufreq policy governor"
 	depends on CPU_FREQ

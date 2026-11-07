@@ -21,6 +21,31 @@ on:
         required: true
         default: "3"
         type: string
+      cpu_experiment:
+        description: Optional isolated CPU experiment
+        required: true
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - sugov_no_up_rate_limit
+          - sugov_no_rate_limit
+      memory_experiment:
+        description: Optional isolated ZRAM compressor comparison
+        required: true
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - zram_lz4hc_default
+      toolchain:
+        description: Clang toolchain selection
+        required: true
+        default: clang-r547379
+        type: choice
+        options:
+          - clang-r547379
+          - clang-r614150
 
 permissions:
   contents: read
@@ -45,6 +70,9 @@ jobs:
       SOURCE_REF: ${{ inputs.source_ref }}
       RELEASE_FLAVOR: ${{ inputs.release_flavor }}
       RELEASE_GENERATION: ${{ inputs.release_generation }}
+      CPU_EXPERIMENT: ${{ inputs.cpu_experiment }}
+      MEMORY_EXPERIMENT: ${{ inputs.memory_experiment }}
+      TOOLCHAIN_SELECTOR: ${{ inputs.toolchain }}
 
     steps:
       - name: Checkout Xen-Kernel source
@@ -62,6 +90,12 @@ jobs:
           [[ -n "$SOURCE_REF" ]] || { echo "::error::source_ref must not be empty"; exit 1; }
           [[ "$RELEASE_FLAVOR" == xen || "$RELEASE_FLAVOR" == ksun ]] || { echo "::error::Invalid release flavor"; exit 1; }
           [[ "$RELEASE_GENERATION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::release_generation must be a positive integer"; exit 1; }
+          [[ "$CPU_EXPERIMENT" == baseline || "$CPU_EXPERIMENT" == sugov_no_up_rate_limit || "$CPU_EXPERIMENT" == sugov_no_rate_limit ]] || { echo "::error::Invalid CPU experiment"; exit 1; }
+          [[ "$MEMORY_EXPERIMENT" == baseline || "$MEMORY_EXPERIMENT" == zram_lz4hc_default ]] || { echo "::error::Invalid memory experiment"; exit 1; }
+          [[ "$TOOLCHAIN_SELECTOR" == clang-r547379 || "$TOOLCHAIN_SELECTOR" == clang-r614150 ]] || { echo "::error::Invalid toolchain selection"; exit 1; }
+          if [[ "$CPU_EXPERIMENT" != baseline && "$MEMORY_EXPERIMENT" != baseline ]]; then
+            echo "::error::Select at most one subsystem experiment per build"; exit 1
+          fi
           ACTUAL_SHA=$(git rev-parse --verify HEAD^{commit})
           if [[ "$SOURCE_REF" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
             REQUESTED_SHA=$(git rev-parse --verify "$SOURCE_REF^{commit}")
@@ -90,6 +124,9 @@ jobs:
           echo "Actual source SHA: $ACTUAL_SHA"
           echo "Workflow trigger ref: ${GITHUB_REF:-unknown}"
           echo "Workflow trigger SHA: ${GITHUB_SHA:-unknown}"
+          echo "CPU experiment: $CPU_EXPERIMENT"
+          echo "Memory experiment: $MEMORY_EXPERIMENT"
+          echo "Toolchain selector: $TOOLCHAIN_SELECTOR"
           echo "RUNNER_OS=${RUNNER_OS:-unknown} RUNNER_ARCH=${RUNNER_ARCH:-unknown} ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
           echo "KBUILD_BUILD_TIMESTAMP=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
           date -u +%Y-%m-%dT%H:%M:%SZ > build-started-utc.txt
@@ -116,6 +153,7 @@ jobs:
             ${{ runner.os }}-xen-default-ccache-
 
       - name: Prepare baseline Clang r547379
+        if: inputs.toolchain == 'clang-r547379'
         shell: bash
         run: |
           set -euo pipefail
@@ -127,12 +165,72 @@ jobs:
           fi
           TOOLCHAIN_COMMIT=$(git -C "$TOOLCHAIN_DIR" rev-parse HEAD)
           TOOLCHAIN_TREE_SHA256=$(cd "$TOOLCHAIN_DIR" && find . -type f ! -path './.git/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+          TOOLCHAIN_ID=clang-r547379
+          TOOLCHAIN_SOURCE=https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git@15.0
+          TOOLCHAIN_ARCHIVE_SHA256=not-applicable-git-checkout
+          TOOLCHAIN_ARCHIVE_URL=not-applicable-git-checkout
           echo "$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
           echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN_DIR/bin" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ID=$TOOLCHAIN_ID" >> "$GITHUB_ENV"
           echo "TOOLCHAIN_COMMIT=$TOOLCHAIN_COMMIT" >> "$GITHUB_ENV"
           echo "TOOLCHAIN_TREE_SHA256=$TOOLCHAIN_TREE_SHA256" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ARCHIVE_SHA256=$TOOLCHAIN_ARCHIVE_SHA256" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_SOURCE=$TOOLCHAIN_SOURCE" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ARCHIVE_URL=$TOOLCHAIN_ARCHIVE_URL" >> "$GITHUB_ENV"
           "$TOOLCHAIN_DIR/bin/clang" --version
           "$TOOLCHAIN_DIR/bin/ld.lld" --version
+
+      - name: Prepare AOSP Clang r614150 (LLVM 23.0.1)
+        if: inputs.toolchain == 'clang-r614150'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_DIR="$RUNNER_TEMP/xen-clang-r614150"
+          ARCHIVE="$RUNNER_TEMP/clang-r614150-aosp.tar.gz"
+          TOOLCHAIN_ARCHIVE_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/16fae8ef5b856b1d3e02a55274e4327c5842bb34/clang-r614150.tar.gz"
+          mkdir -p "$TOOLCHAIN_DIR"
+          curl --fail --location --retry 3 --retry-all-errors --output "$ARCHIVE" "$TOOLCHAIN_ARCHIVE_URL"
+          TOOLCHAIN_ARCHIVE_SHA256=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+          TOOLCHAIN_ACQUIRED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tar -xzf "$ARCHIVE" -C "$TOOLCHAIN_DIR"
+          test -x "$TOOLCHAIN_DIR/bin/clang"
+          test -x "$TOOLCHAIN_DIR/bin/ld.lld"
+          TOOLCHAIN_COMMIT=16fae8ef5b856b1d3e02a55274e4327c5842bb34
+          TOOLCHAIN_TREE_SHA256=$(cd "$TOOLCHAIN_DIR" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+          TOOLCHAIN_ID=clang-r614150
+          TOOLCHAIN_SOURCE=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          CLANG_VERSION=$("$TOOLCHAIN_DIR/bin/clang" --version)
+          LLD_VERSION=$("$TOOLCHAIN_DIR/bin/ld.lld" --version)
+          {
+            echo "toolchain_selector=$TOOLCHAIN_ID"
+            echo "toolchain_source_commit=$TOOLCHAIN_COMMIT"
+            echo "toolchain_archive_url=$TOOLCHAIN_ARCHIVE_URL"
+            echo "toolchain_archive_sha256=$TOOLCHAIN_ARCHIVE_SHA256"
+            echo "toolchain_acquired_at_utc=$TOOLCHAIN_ACQUIRED_AT"
+            echo "toolchain_android_version=$(cat "$TOOLCHAIN_DIR/AndroidVersion.txt")"
+            echo "toolchain_clang_version=$(printf '%s\n' "$CLANG_VERSION" | sed -n '1p')"
+            echo "toolchain_lld_version=$(printf '%s\n' "$LLD_VERSION" | sed -n '1p')"
+          } | tee toolchain-acquisition.txt
+          grep -q '23\.0\.1' <<< "$CLANG_VERSION" || {
+            echo "::error::AOSP clang-r614150 did not report LLVM 23.0.1"; exit 1;
+          }
+          grep -q 'LLD 23\.0\.1' <<< "$LLD_VERSION" || {
+            echo "::error::AOSP ld.lld did not report LLD 23.0.1"; exit 1;
+          }
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
+            test -x "$TOOLCHAIN_DIR/bin/$tool" || { echo "::error::Missing toolchain binary $tool"; exit 1; }
+          done
+          echo "$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
+          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN_DIR/bin" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ID=$TOOLCHAIN_ID" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_COMMIT=$TOOLCHAIN_COMMIT" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_TREE_SHA256=$TOOLCHAIN_TREE_SHA256" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ARCHIVE_SHA256=$TOOLCHAIN_ARCHIVE_SHA256" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ACQUIRED_AT=$TOOLCHAIN_ACQUIRED_AT" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_SOURCE=$TOOLCHAIN_SOURCE" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_ARCHIVE_URL=$TOOLCHAIN_ARCHIVE_URL" >> "$GITHUB_ENV"
 
       - name: Validate source and toolchains
         shell: bash
@@ -156,8 +254,14 @@ jobs:
           echo "===== GCC32 ====="
           arm-linux-gnueabi-gcc --version
           echo "===== Clang ====="
-          "$TOOLCHAIN_DIR/bin/clang" --version
-          "$TOOLCHAIN_DIR/bin/ld.lld" --version
+          "$TOOLCHAIN_BIN/clang" --version
+          "$TOOLCHAIN_BIN/ld.lld" --version
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
+            resolved=$(command -v "$tool")
+            [[ "$resolved" == "$TOOLCHAIN_BIN/$tool" ]] || {
+              echo "::error::$tool resolved outside selected toolchain: $resolved"; exit 1;
+            }
+          done
 
       - name: Record source identity and apply checked build patches
         shell: bash
@@ -207,13 +311,9 @@ jobs:
 
           path = Path("drivers/block/zram/zram_drv.c")
           text = path.read_text()
-          match = re.search(r'(?m)^\s*static const char \*default_compressor\s*=\s*"([^"]+)"\s*;', text)
-          if not match:
-              raise SystemExit("Cannot identify ZRAM default_compressor; refusing unverified baseline source.")
-          current = match.group(1)
-          if current != "lz4":
-              raise SystemExit(f"Expected tracked Xen baseline ZRAM default lz4; found {current!r}; no source edit will be made.")
-          print("ZRAM baseline source default is lz4; implementation is unchanged.")
+          if '#ifdef CONFIG_XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT\nstatic const char *default_compressor = "lz4hc";\n#else\nstatic const char *default_compressor = "lz4";\n#endif' not in text:
+              raise SystemExit("Expected explicit LZ4 baseline / opt-in LZ4HC source selection; refusing unverified ZRAM source.")
+          print("ZRAM source retains LZ4 baseline and has an explicit opt-in LZ4HC default.")
           PY
           grep -n 'default_compressor' drivers/block/zram/zram_drv.c
           git diff --check
@@ -222,7 +322,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export PATH="$TOOLCHAIN_BIN:$PATH"
 
           LLVM_VARS=(
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm STRIP=llvm-strip
@@ -254,11 +354,28 @@ jobs:
             --disable LTO_NONE \
             --enable CC_OPTIMIZE_FOR_PERFORMANCE \
             --disable CC_OPTIMIZE_FOR_SIZE 
+
+          if [[ "$CPU_EXPERIMENT" == sugov_no_rate_limit ]]; then
+            scripts/config --file out/.config --enable XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+            scripts/config --file out/.config --disable XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT
+          elif [[ "$CPU_EXPERIMENT" == sugov_no_up_rate_limit ]]; then
+            scripts/config --file out/.config --disable XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+            scripts/config --file out/.config --enable XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT
+          else
+            scripts/config --file out/.config --disable XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT
+            scripts/config --file out/.config --disable XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT
+          fi
+
+          if [[ "$MEMORY_EXPERIMENT" == zram_lz4hc_default ]]; then
+            scripts/config --file out/.config --enable XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT
+          else
+            scripts/config --file out/.config --disable XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT
+          fi
             
           "${KMAKE[@]}" olddefconfig
 
           echo "===== Effective LTO / optimization / governor configuration ====="
-          grep -E '^(CONFIG_(LTO|LTO_CLANG|THINLTO|LTO_NONE|CC_OPTIMIZE_FOR_PERFORMANCE|CC_OPTIMIZE_FOR_SIZE|CPU_FREQ|CPU_FREQ_GOV_SCHEDUTIL|CPU_FREQ_DEFAULT_GOV))=|^# CONFIG_(LTO|LTO_CLANG|THINLTO|LTO_NONE|CC_OPTIMIZE_FOR_PERFORMANCE|CC_OPTIMIZE_FOR_SIZE|CPU_FREQ_GOV_SCHEDUTIL) is not set' out/.config || true
+          grep -E '^(CONFIG_(LTO|LTO_CLANG|THINLTO|LTO_NONE|CC_OPTIMIZE_FOR_PERFORMANCE|CC_OPTIMIZE_FOR_SIZE|CPU_FREQ|CPU_FREQ_GOV_SCHEDUTIL|CPU_FREQ_DEFAULT_GOV|XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT|XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT|XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT|CRYPTO_LZ4|CRYPTO_LZ4HC))=|^# CONFIG_(LTO|LTO_CLANG|THINLTO|LTO_NONE|CC_OPTIMIZE_FOR_PERFORMANCE|CC_OPTIMIZE_FOR_SIZE|CPU_FREQ_GOV_SCHEDUTIL|XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT|XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT|XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT|CRYPTO_LZ4HC) is not set' out/.config || true
 
           if ! grep -q '^CONFIG_LTO=y$' out/.config ||
              ! grep -q '^CONFIG_LTO_CLANG=y$' out/.config ||
@@ -268,16 +385,53 @@ jobs:
             exit 1
           fi
 
+          if [[ "$MEMORY_EXPERIMENT" == zram_lz4hc_default ]]; then
+            grep -q '^CONFIG_XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT=y$' out/.config || {
+              echo "::error::LZ4HC ZRAM experiment did not survive olddefconfig"; exit 1;
+            }
+            grep -q '^CONFIG_CRYPTO_LZ4HC=y$' out/.config || {
+              echo "::error::LZ4HC compressor is unavailable in effective config"; exit 1;
+            }
+          elif grep -q '^CONFIG_XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT=y$' out/.config; then
+            echo "::error::baseline ZRAM config unexpectedly enables LZ4HC experiment"; exit 1
+          fi
+
           if ! grep -q '^CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y$' out/.config ||
              grep -q '^CONFIG_CC_OPTIMIZE_FOR_SIZE=y$'; then
             echo "::error::-O2 performance optimization is not selected in final .config."
             exit 1
           fi
 
+          if [[ "$CPU_EXPERIMENT" == sugov_no_rate_limit ]]; then
+            grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT=y$' out/.config || {
+              echo "::error::schedutil experiment did not survive olddefconfig"; exit 1;
+            }
+            if grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT=y$' out/.config; then
+              echo "::error::schedutil experiment options are not mutually exclusive"; exit 1;
+            fi
+          elif [[ "$CPU_EXPERIMENT" == sugov_no_up_rate_limit ]]; then
+            grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT=y$' out/.config || {
+              echo "::error::schedutil upward-only experiment did not survive olddefconfig"; exit 1;
+            }
+            if grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT=y$' out/.config; then
+              echo "::error::schedutil experiment options are not mutually exclusive"; exit 1;
+            fi
+          else
+            if grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_RATE_LIMIT=y$' out/.config ||
+               grep -q '^CONFIG_XEN_EXPERIMENT_SUGOV_NO_UP_RATE_LIMIT=y$' out/.config; then
+              echo "::error::baseline build unexpectedly enabled schedutil experiment"; exit 1;
+            fi
+          fi
+
           {
             echo "ThinLTO: PASS (CONFIG_LTO=y CONFIG_LTO_CLANG=y CONFIG_THINLTO=y)"
             echo "Performance optimization: PASS (CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y)"
+            echo "CPU experiment: $CPU_EXPERIMENT"
+            echo "Memory experiment: $MEMORY_EXPERIMENT"
           } | tee config-validation.txt
+
+          printf '%s\n' "$CPU_EXPERIMENT" | tee cpu-experiment.txt
+          printf '%s\n' "$MEMORY_EXPERIMENT" | tee memory-experiment.txt
 
           
           cp out/.config xen-default.config
@@ -296,7 +450,7 @@ jobs:
           if matches != [""]:
               raise SystemExit(f"Expected exactly one empty EXTRAVERSION after checked release patch; found {matches!r}")
           PY
-          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export PATH="$TOOLCHAIN_BIN:$PATH"
           RELEASE=$(make ARCH=arm64 O=out CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 kernelrelease)
           printf '%s\n' "$RELEASE" | tee kernel-release-validated.txt
           if [[ "$RELEASE_FLAVOR" == ksun ]]; then
@@ -312,9 +466,10 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export PATH="$TOOLCHAIN_BIN:$PATH"
+          date -u +%Y-%m-%dT%H:%M:%SZ > compile-started-utc.txt
           set +e
-          make -j"$(nproc)" \
+          BUILD_CMD=(make -j"$(nproc)" \
             O=out \
             ARCH=arm64 \
             SUBARCH=arm64 \
@@ -338,8 +493,14 @@ jobs:
             LLVM_IAS=1 \
             CC="ccache clang" \
             V=1 \
-            Image 2>&1 | tee build.log
+            Image)
+          if [[ -x /usr/bin/time ]]; then
+            /usr/bin/time -v -o build-resource-usage.txt "${BUILD_CMD[@]}" 2>&1 | tee build.log
+          else
+            "${BUILD_CMD[@]}" 2>&1 | tee build.log
+          fi
           BUILD_STATUS=${PIPESTATUS[0]}
+          date -u +%Y-%m-%dT%H:%M:%SZ > compile-finished-utc.txt
           set -e
           ccache -s || true
           if [ "$BUILD_STATUS" -ne 0 ]; then
@@ -382,13 +543,39 @@ jobs:
           mkdir -p artifacts
           date -u +%Y-%m-%dT%H:%M:%SZ > artifacts/collected-at-utc.txt
           [[ ! -f build-started-utc.txt ]] || cp build-started-utc.txt artifacts/
+          [[ ! -f compile-started-utc.txt ]] || cp compile-started-utc.txt artifacts/
+          [[ ! -f compile-finished-utc.txt ]] || cp compile-finished-utc.txt artifacts/
+          [[ ! -f build-resource-usage.txt ]] || cp build-resource-usage.txt artifacts/
+          COMPILE_DURATION_SECONDS=unavailable
+          if [[ -f compile-started-utc.txt && -f compile-finished-utc.txt ]]; then
+            COMPILE_START_EPOCH=$(date -u -d "$(cat compile-started-utc.txt)" +%s)
+            COMPILE_FINISH_EPOCH=$(date -u -d "$(cat compile-finished-utc.txt)" +%s)
+            COMPILE_DURATION_SECONDS=$((COMPILE_FINISH_EPOCH - COMPILE_START_EPOCH))
+          fi
+          {
+            echo "workflow_job_status=${{ job.status }}"
+            echo "toolchain=${TOOLCHAIN_ID:-unknown}"
+            echo "source_sha=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "release_flavor=${RELEASE_FLAVOR:-unknown}"
+            echo "release_generation=${RELEASE_GENERATION:-unknown}"
+            echo "cpu_experiment=${CPU_EXPERIMENT:-unknown}"
+            echo "memory_experiment=${MEMORY_EXPERIMENT:-unknown}"
+            echo "workflow_started_utc=$(cat build-started-utc.txt 2>/dev/null || echo unknown)"
+            echo "artifacts_collected_utc=$(cat artifacts/collected-at-utc.txt)"
+            echo "compile_started_utc=$(cat compile-started-utc.txt 2>/dev/null || echo unknown)"
+            echo "compile_finished_utc=$(cat compile-finished-utc.txt 2>/dev/null || echo unknown)"
+            echo "compile_duration_seconds=$COMPILE_DURATION_SECONDS"
+          } > artifacts/build-report.txt
           [[ ! -f original-source-sha.txt ]] || cp original-source-sha.txt artifacts/
           [[ ! -f applied-patches.txt ]] || cp applied-patches.txt artifacts/
           [[ ! -f config-validation.txt ]] || cp config-validation.txt artifacts/
+          [[ ! -f cpu-experiment.txt ]] || cp cpu-experiment.txt artifacts/
+          [[ ! -f memory-experiment.txt ]] || cp memory-experiment.txt artifacts/
           [[ ! -f source-validation.txt ]] || cp source-validation.txt artifacts/
           [[ ! -f release-validation.txt ]] || cp release-validation.txt artifacts/
           [[ ! -f kernel-release-validated.txt ]] || cp kernel-release-validated.txt artifacts/
           [[ ! -f build.log ]] || cp build.log artifacts/
+          [[ ! -f build-resource-usage.txt ]] || cp build-resource-usage.txt artifacts/
           [[ ! -f xen-default.config ]] || cp xen-default.config artifacts/
           [[ ! -f out/.config ]] || cp out/.config artifacts/kernel.config
           [[ -s out/arch/arm64/boot/Image ]] || true
@@ -428,16 +615,26 @@ jobs:
             echo "checkout_action=actions/checkout@v4 (mutable major tag)"
             echo "cache_action=actions/cache@v4 (mutable major tag)"
             echo "upload_artifact_action=actions/upload-artifact@v4 (mutable major tag)"
-            echo "clang_source=https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git"
-            echo "clang_ref=15.0 (mutable branch; resolved commit and content tree hash are in toolchain-provenance.txt)"
+            echo "selected_toolchain=${TOOLCHAIN_ID:-unknown}"
+            echo "selected_toolchain_source=${TOOLCHAIN_SOURCE:-unknown}"
+            echo "selected_toolchain_archive_url=${TOOLCHAIN_ARCHIVE_URL:-unknown}"
+            echo "selected_toolchain_archive_sha256=${TOOLCHAIN_ARCHIVE_SHA256:-unknown}"
+            echo "baseline_clang_source=https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git"
+            echo "baseline_clang_ref=15.0 (mutable branch; resolved commit and content tree hash are in toolchain-provenance.txt)"
             echo "--- installed versions ---"
             dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | sort || true
           } > artifacts/mutable-dependencies.txt
           {
+            echo "toolchain_selector=${TOOLCHAIN_ID:-unknown}"
+            echo "toolchain_source=${TOOLCHAIN_SOURCE:-unknown}"
+            echo "toolchain_archive_url=${TOOLCHAIN_ARCHIVE_URL:-unknown}"
+            echo "toolchain_archive_sha256=${TOOLCHAIN_ARCHIVE_SHA256:-unknown}"
+            echo "toolchain_acquired_at_utc=${TOOLCHAIN_ACQUIRED_AT:-not-applicable}"
             echo "toolchain_git_commit=${TOOLCHAIN_COMMIT:-unknown}"
             echo "toolchain_tree_sha256=${TOOLCHAIN_TREE_SHA256:-unknown}"
             echo "original_source_sha=${ORIGINAL_SOURCE_SHA:-unknown}"
           } > artifacts/toolchain-provenance.txt
+          [[ ! -f toolchain-acquisition.txt ]] || cp toolchain-acquisition.txt artifacts/
           clang --version > artifacts/clang-version.txt 2>&1 || true
           ld.lld --version > artifacts/lld-version.txt 2>&1 || true
           aarch64-linux-gnu-gcc --version > artifacts/gcc-aarch64-version.txt 2>&1 || true
@@ -467,13 +664,27 @@ jobs:
             grep -E -m 200 'clang version|clang .* -c |ld\.lld|-flto=thin|thinlto|ThinLTO|CONFIG_(LTO|LTO_CLANG|THINLTO)' build.log > artifacts/thinlto-build-evidence.txt || true
           fi
           find artifacts -type f ! -name artifact-checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > artifacts/artifact-checksums.sha256
+          if [[ "${{ job.status }}" == success && -s artifacts/Image ]]; then
+            BUNDLE_NAME="${TOOLCHAIN_ID:-unknown}-vayu-${RELEASE_FLAVOR:-xen}-${RELEASE_GENERATION:-unknown}-bundle.zip"
+            BUNDLE_FILES=(Image Image.sha256 Image.size.txt kernel.config kernel-release.txt source-commit.txt source-branch.txt toolchain-provenance.txt clang-version.txt lld-version.txt build.log build-report.txt config-validation.txt artifact-checksums.sha256)
+            [[ ! -s artifacts/build-resource-usage.txt ]] || BUNDLE_FILES+=(build-resource-usage.txt)
+            [[ ! -s artifacts/Image.gz ]] || BUNDLE_FILES+=(Image.gz)
+            [[ ! -s artifacts/Image.gz-dtb ]] || BUNDLE_FILES+=(Image.gz-dtb)
+            (cd artifacts && zip -q "$BUNDLE_NAME" "${BUNDLE_FILES[@]}") || {
+              echo "::error::Could not create kernel artifact bundle"; exit 1;
+            }
+            sha256sum "artifacts/$BUNDLE_NAME" > "artifacts/$BUNDLE_NAME.sha256" || {
+              echo "::error::Could not checksum kernel artifact bundle"; exit 1;
+            }
+            find artifacts -type f ! -name artifact-checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > artifacts/artifact-checksums.sha256
+          fi
           find artifacts -type f -exec ls -lh '{}' \;
 
       - name: Upload Xen-Kernel Default artifacts
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Xen-Kernel-Default
+          name: Xen-Kernel-vayu-${{ inputs.toolchain }}-${{ inputs.cpu_experiment }}-${{ inputs.memory_experiment }}-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: warn
           retention-days: 30

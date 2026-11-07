@@ -41,7 +41,11 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
+#ifdef CONFIG_XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT
+static const char *default_compressor = "lz4hc";
+#else
 static const char *default_compressor = "lz4";
+#endif
 
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;

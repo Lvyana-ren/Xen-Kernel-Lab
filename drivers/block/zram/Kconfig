@@ -15,6 +15,20 @@ config ZRAM
 
 	  See Documentation/blockdev/zram.txt for more information.
 
+config XEN_EXPERIMENT_ZRAM_LZ4HC_DEFAULT
+	bool "Xen experiment: use LZ4HC as the ZRAM initial default"
+	depends on ZRAM && CRYPTO_LZ4
+	select CRYPTO_LZ4HC
+	default n
+	help
+	  Experimental comparison only. Select LZ4HC as the initial compressor
+	  for newly created ZRAM devices. The baseline remains LZ4. Android
+	  userspace may change the compressor before initializing a device, so
+	  inspect the active runtime algorithm before interpreting results.
+	  LZ4HC may improve compression ratio while increasing compression CPU
+	  time and energy. Measure memory savings, CPU use, latency and energy
+	  under controlled memory pressure before considering acceptance.
+
 config ZRAM_DEDUP
 	bool "Deduplication support for ZRAM data"
 	depends on ZRAM
