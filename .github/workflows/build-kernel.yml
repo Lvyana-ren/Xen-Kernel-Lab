@@ -87,6 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s scripts/xen-baseline -p 'test_*release*.py' -v
           [[ -n "$SOURCE_REF" ]] || { echo "::error::source_ref must not be empty"; exit 1; }
           [[ "$RELEASE_FLAVOR" == xen || "$RELEASE_FLAVOR" == ksun ]] || { echo "::error::Invalid release flavor"; exit 1; }
           [[ "$RELEASE_GENERATION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::release_generation must be a positive integer"; exit 1; }
@@ -453,12 +454,11 @@ jobs:
           export PATH="$TOOLCHAIN_BIN:$PATH"
           RELEASE=$(make ARCH=arm64 O=out CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 kernelrelease)
           printf '%s\n' "$RELEASE" | tee kernel-release-validated.txt
-          if [[ "$RELEASE_FLAVOR" == ksun ]]; then
-            [[ "$RELEASE" =~ ^4\.14\.357-Xen-KSUN\+[1-9][0-9]*$ ]] || { echo "::error::Unexpected KSUN kernel release: $RELEASE"; exit 1; }
-          else
-            [[ "$RELEASE" =~ ^4\.14\.357-Xen\+[1-9][0-9]*$ ]] || { echo "::error::Unexpected Xen kernel release: $RELEASE"; exit 1; }
-          fi
-          [[ "$RELEASE" == "4.14.357${LOCAL_VERSION}" ]] || { echo "::error::Generated release does not match requested flavor/generation"; exit 1; }
+          python3 scripts/xen-baseline/validate_kernel_release.py \
+            --makefile Makefile \
+            --release "$RELEASE" \
+            --flavor "$RELEASE_FLAVOR" \
+            --generation "$RELEASE_GENERATION"
           echo "Kernel release validation: PASS ($RELEASE)" | tee release-validation.txt
           git diff --check
 
