@@ -10,36 +10,39 @@ class ReleaseValidationError(ValueError):
     """Raised when the source version or generated release is unexpected."""
 
 
-# Restrict whitespace matching to horizontal whitespace. In particular, \s
-# must not consume the newline after an empty assignment and capture NAME.
-_EXTRAVERSION_ASSIGNMENT = re.compile(
-    r"^[\t ]*EXTRAVERSION[\t ]*=[\t ]*(.*?)[\t ]*(?:\#.*)?$"
-)
+_EXTRAVERSION_ASSIGNMENT_LINE = re.compile(r"^(EXTRAVERSION)[ \t]*=(.*)$")
+
+
+def extract_extraversion_values(makefile_text: str) -> list[str]:
+    """Return values from exact EXTRAVERSION assignments, line by line."""
+    lines = makefile_text.splitlines()
+    # Normalize horizontal whitespace only, then apply the exact matcher below.
+    # This also gives an empty RHS the horizontal separator required by that
+    # expression without allowing it to cross the next Makefile line.
+    normalized_lines = []
+    for line in lines:
+        assignment = _EXTRAVERSION_ASSIGNMENT_LINE.fullmatch(line)
+        if assignment:
+            value = assignment.group(2).lstrip(" \t")
+            line = f"{assignment.group(1)} = {value}"
+        normalized_lines.append(line)
+    normalized_text = "\n".join(normalized_lines)
+    matches = re.findall(r"(?m)^EXTRAVERSION[ \t]=[ \t](.*)$", normalized_text)
+    return [value.strip(" \t") for value in matches]
 
 
 def validate_extraversion(makefile_text: str) -> None:
     """Require exactly one uncommented EXTRAVERSION assignment with no value."""
-    assignments = []
-    for line_number, line in enumerate(makefile_text.splitlines(), start=1):
-        if line.lstrip(" \t").startswith("#"):
-            continue
-        match = _EXTRAVERSION_ASSIGNMENT.fullmatch(line)
-        if match:
-            assignments.append((line_number, match.group(1)))
-
-    if len(assignments) != 1:
+    matches = extract_extraversion_values(makefile_text)
+    if len(matches) != 1:
         raise ReleaseValidationError(
             "expected exactly one EXTRAVERSION assignment; "
-            f"found {len(assignments)} at lines "
-            f"{[number for number, _value in assignments]}"
+            f"found {len(matches)}"
         )
 
-    line_number, value = assignments[0]
+    value = matches[0]
     if value.strip(" \t"):
-        raise ReleaseValidationError(
-            f"EXTRAVERSION must be empty after the checked release patch "
-            f"(line {line_number} contains {value.strip()!r})"
-        )
+        raise ReleaseValidationError("EXTRAVERSION must be empty after the checked release patch")
 
 
 def expected_release(flavor: str, generation: str) -> str:

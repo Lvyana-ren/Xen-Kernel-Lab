@@ -447,7 +447,16 @@ jobs:
 
           path = Path("Makefile")
           text = path.read_text()
-          matches = re.findall(r"(?m)^EXTRAVERSION\s*=\s*(.*)$", text)
+          lines = []
+          for line in text.splitlines():
+              assignment = re.fullmatch(r"(EXTRAVERSION)[ \t]*=(.*)$", line)
+              if assignment:
+                  value = assignment.group(2).lstrip(" \t")
+                  line = f"{assignment.group(1)} = {value}"
+              lines.append(line)
+          text = "\n".join(lines)
+          matches = re.findall(r"(?m)^EXTRAVERSION[ \t]=[ \t](.*)$", text)
+          matches = [match.strip(" \t") for match in matches]
           if matches != [""]:
               raise SystemExit(f"Expected exactly one empty EXTRAVERSION after checked release patch; found {matches!r}")
           PY
